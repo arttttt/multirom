@@ -1,6 +1,7 @@
 [submodule "kexec-tools"]
 	path = kexec-tools
-	url = https://github.com/Tasssadar/kexec-tools
+	url = https://github.com/arttttt/kexec-tools-mocha
+	branch = master
 [submodule "adbd"]
 	path = adbd
 	url = https://github.com/multirom-dev/multirom_adbd.git
