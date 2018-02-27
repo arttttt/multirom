@@ -2,11 +2,17 @@ LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 
 LOCAL_MODULE:= trampoline_encmnt
-LOCAL_MODULE_TAGS := eng
+LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE_PATH := $(TARGET_ROOT_OUT)
 LOCAL_UNSTRIPPED_PATH := $(TARGET_ROOT_OUT_UNSTRIPPED)
 LOCAL_SHARED_LIBRARIES := libcryptfslollipop libcutils
 LOCAL_STATIC_LIBRARIES := libmultirom_static
+
+LOCAL_ADDITIONAL_DEPENDENCIES += libstdc++
+
+ifeq ($(TARGET_HW_DISK_ENCRYPTION),true)
+    LOCAL_ADDITIONAL_DEPENDENCIES += libcryptfs_hw
+endif
 
 MR_NO_KEXEC_MK_OPTIONS := true 1 allowed 2 enabled 3 ui_confirm 4 ui_choice 5 forced
 ifneq (,$(filter $(MR_NO_KEXEC), $(MR_NO_KEXEC_MK_OPTIONS)))
@@ -29,6 +35,7 @@ LOCAL_SRC_FILES := \
     encmnt.c \
     pw_ui.c \
     ../rom_quirks.c \
+    ../rq_inject_file_contexts.c \
 
 include $(multirom_local_path)/device_defines.mk
 
@@ -39,7 +46,7 @@ ifeq ($(MR_ENCRYPTION_FAKE_PROPERTIES),true)
     include $(CLEAR_VARS)
 
     LOCAL_MODULE := libmultirom_fake_properties
-    LOCAL_MODULE_TAGS := eng
+    LOCAL_MODULE_TAGS := optional
     LOCAL_C_INCLUDES += $(multirom_local_path)
 
     LOCAL_SRC_FILES := fake_properties.c

@@ -66,6 +66,7 @@
 #define NTFS_BIN "ntfs-3g"
 #define EXFAT_BIN "exfat-fuse"
 #define INTERNAL_ROM_NAME "Internal"
+#define INTERNAL_RECOVERY_NAME "Recovery"
 #define MAX_ROM_NAME_LEN 26
 #define LAYOUT_VERSION "/data/.layout_version"
 
@@ -76,6 +77,9 @@ static char kexec_path[64] = { 0 };
 static char ntfs_path[64] = { 0 };
 static char exfat_path[64] = { 0 };
 static char partition_dir[64] = { 0 };
+static char external_mount_fs[5] = { 0 };
+static char external_mount_part[256] = { 0 };
+static char external_mount_path[256] = { 0 };
 
 static volatile int run_usb_refresh = 0;
 static pthread_t usb_refresh_thread;
@@ -88,6 +92,10 @@ int multirom_find_base_dir(void)
     struct stat info;
 
     static const char *paths[] = {
+        REALDATA"/media/0/MultiROM/multirom",
+        REALDATA"/media/MultiROM/multirom",
+        "/data/media/0/MultiROM/multirom",
+        "/data/media/MultiROM/multirom",
         REALDATA"/media/0/multirom", // 4.2
         REALDATA"/media/multirom",
         "/data/media/0/multirom",
@@ -275,7 +283,7 @@ int multirom(const char *rom_to_boot)
     {
         ERROR(NO_KEXEC_LOG_TEXT ": Something went wrong in mounting the needed partition, so falling back...");
         nokexec()->selected_method = NO_KEXEC_BOOT_NORMAL;
-        s.is_second_boot = 0;
+        s.is_second_boot = 0; 
         //ERROR(NO_KEXEC_LOG_TEXT ":    to Internal\n");     s.auto_boot_type = AUTOBOOT_FORCE_CURRENT;                // force reboot to Internal (this would be mrom default behaviour)
         //ERROR(NO_KEXEC_LOG_TEXT ":    to MultiROM GUI\n"); s.auto_boot_type = AUTOBOOT_NAME;                         // bring up the gui instead
         ERROR(NO_KEXEC_LOG_TEXT ":    to Recovery\n"); exit = (EXIT_REBOOT_RECOVERY | EXIT_UMOUNT);  goto finish;      // reboot to recovery
@@ -284,31 +292,7 @@ int multirom(const char *rom_to_boot)
 
     if(rom_to_boot != NULL)
     {
-        struct multirom_rom *rom = NULL;
-
-        // Parse rom_to_boot should be: Name_of_ROM++uuid=xxxx  (the '++uuid=xxxx' is optional but needed for external ROMs)
-        char * uuid_ptr = strstr(rom_to_boot, "++uuid=");
-        if(uuid_ptr == NULL)
-        {
-            rom = multirom_get_rom(&s, rom_to_boot, NULL);
-        }
-        else
-        {
-            char name[MAX_ROM_NAME_LEN + 1];
-            char part_uuid[36+4+1];
-
-            strncpy(name, rom_to_boot, uuid_ptr - rom_to_boot);
-            name[uuid_ptr - rom_to_boot] = 0;
-
-            strcpy(part_uuid, uuid_ptr + sizeof("++uuid=") - 1);
-
-            // Note: if the current ROM is on the same external partition as the one being booted
-            //       then this function would already have been called in multirom_load_status
-            multirom_update_and_scan_for_external_roms(&s, part_uuid);
-
-            rom = multirom_get_rom(&s, name, part_uuid);
-        }
-
+        struct multirom_rom *rom = multirom_get_rom(&s, rom_to_boot, NULL);
         if(rom)
         {
             // Two possible scenarios: this ROM has kexec-hardboot and target
@@ -320,14 +304,6 @@ int multirom(const char *rom_to_boot)
                 s.is_second_boot = 0;
                 INFO("Booting ROM %s...\n", rom_to_boot);
             }
-#ifdef MR_NO_KEXEC
-            else if(((M(rom->type) & MASK_KEXEC) || rom->has_bootimg) && rom->type != ROM_DEFAULT)
-            {
-                to_boot = rom;
-                s.is_second_boot = 0;
-                INFO(NO_KEXEC_LOG_TEXT " Booting ROM %s...\n", rom_to_boot);
-            }
-#endif
             else
             {
                 s.current_rom = rom;
@@ -383,16 +359,8 @@ int multirom(const char *rom_to_boot)
 
 #ifdef MR_NO_KEXEC
         #define MR_NO_KEXEC_ABORT { \
-                    if(rom_to_boot == NULL) { \
-                        ERROR(NO_KEXEC_LOG_TEXT ": ERROR occurred in the above, aborting to recovery\n"); \
-                        exit = (EXIT_REBOOT_RECOVERY | EXIT_UMOUNT); \
-                    } \
-                    else \
-                    { \
-                        ERROR(NO_KEXEC_LOG_TEXT ": ERROR occurred in the above, failed to boot '%s'\n", rom_to_boot); \
-                        exit = EXIT_UMOUNT; \
-                    } \
-                    goto finish; \
+                    ERROR("NO_KEXEC: ERROR occurred in the above, aborting to recovery\n"); \
+                    exit = (EXIT_REBOOT_RECOVERY | EXIT_UMOUNT);  goto finish; \
                 }
 
         if (s.is_second_boot != 0)
@@ -467,7 +435,22 @@ finish:
     nokexec_free_struct();
 #endif
     if (s.enable_kmsg_logging != 0)
+    {
         multirom_kmsg_logging(BACKUP_LATE_KLOG);
+    }
+
+    // Restore the original boot values
+    if (s.is_recovery_boot == 1)
+    {
+        INFO("Restoring boot params before Recovery MultiROM\n");
+        s.auto_boot_rom = NULL;
+        s.auto_boot_seconds = s.bckp_auto_boot_seconds;
+        s.auto_boot_type = s.bckp_auto_boot_type;
+        s.curr_rom_part = s.bckp_curr_rom_part;
+        s.hide_internal = s.bckp_hide_internal;
+        multirom_dump_status(&s);
+    }
+
     multirom_save_status(&s);
     multirom_free_status(&s);
 
@@ -618,149 +601,6 @@ static int compare_rom_names(const void *a, const void *b)
     return 0;
 }
 
-int multirom_apk_get_roms(struct multirom_status *s)
-{
-    if(multirom_find_base_dir() == -1)
-    {
-        printf("Could not find multirom dir\n");
-        return -1;
-    }
-
-    char current_rom[256] = { 0 };
-    s->curr_rom_part = NULL;
-
-    /* Read multirom.ini to find current_rom */
-    char arg[256];
-    sprintf(arg, "%s/multirom.ini", mrom_dir());
-
-    FILE *f = fopen(arg, "re");
-    if(f)
-    {
-        char line[1024];
-
-        char name[64];
-        char *pch;
-
-        while((fgets(line, sizeof(line), f)))
-        {
-            pch = strtok (line, "=\n");
-            if(!pch) continue;
-            strcpy(name, pch);
-            pch = strtok (NULL, "=\n");
-            if(!pch) continue;
-            strcpy(arg, pch);
-
-            if(strstr(name, "current_rom"))
-                strcpy(current_rom, arg);
-            else if(strstr(name, "curr_rom_part"))
-                s->curr_rom_part = strdup(arg);
-        }
-
-        printf("current_rom='%s' curr_rom_part='%s'\n", current_rom, (s->curr_rom_part ? s->curr_rom_part : ""));
-
-        fclose(f);
-    }
-    else
-    {
-        printf("Failed to open config file, setting current_rom to null!\n");
-    }
-
-    /* Get Internal ROM */
-    char roms_path[256];
-    sprintf(roms_path, "%s/roms/"INTERNAL_ROM_NAME, mrom_dir());
-    DIR *d = opendir(roms_path);
-    if(!d)
-    {
-        printf("Failed to open Internal ROM's folder, creating one with ROM from internal memory...\n");
-        multirom_import_internal();
-    }
-    else
-        closedir(d);
-
-    /* Get Internal Storage ROMs */
-    sprintf(roms_path, "%s/roms", mrom_dir());
-    d = opendir(roms_path);
-    if(!d)
-    {
-        printf("Failed to open roms dir!\n");
-        //return -1;
-    }
-    else
-    {
-        struct dirent *dr;
-        char path[256];
-        struct multirom_rom **add_roms = NULL;
-        while((dr = readdir(d)))
-        {
-            if(dr->d_name[0] == '.')
-                continue;
-
-            if(dr->d_type != DT_DIR)
-                continue;
-
-            if(strlen(dr->d_name) > MAX_ROM_NAME_LEN)
-            {
-                printf("Skipping ROM %s, name is too long (max %d chars allowed)\n", dr->d_name, MAX_ROM_NAME_LEN);
-                continue;
-            }
-
-            //printf("Adding ROM %s\n", dr->d_name);
-
-            struct multirom_rom *rom = malloc(sizeof(struct multirom_rom));
-            memset(rom, 0, sizeof(struct multirom_rom));
-
-            rom->id = multirom_generate_rom_id();
-            rom->name = strdup(dr->d_name);
-
-            snprintf(path, sizeof(path), "%s/%s", roms_path, rom->name);
-            rom->base_path = strdup(path);
-
-            rom->type = multirom_get_rom_type(rom);
-
-            snprintf(path, sizeof(path), "%s/boot.img", rom->base_path);
-            rom->has_bootimg = access(path, R_OK) == 0 ? 1 : 0;
-
-            multirom_find_rom_icon(rom);
-
-            list_add(&add_roms, rom);
-        }
-
-        closedir(d);
-
-        if(add_roms)
-        {
-            // sort roms
-            qsort(add_roms, list_item_count(add_roms), sizeof(struct multirom_rom*), compare_rom_names);
-
-            // add them to main list
-            list_swap(&add_roms, &s->roms);
-        }
-    }
-
-    /* Get External ROMs */
-    multirom_update_partitions(s);
-
-    int i;
-    pthread_mutex_lock(&parts_mutex);
-    for(i = 0; s->partitions && s->partitions[i]; ++i)
-    {
-        s->partitions[i]->keep_mounted = 1; // don't unmount on exit, the APK will need access to the folders
-        multirom_scan_partition_for_roms(s, s->partitions[i]);
-    }
-    pthread_mutex_unlock(&parts_mutex);
-
-
-    s->current_rom = multirom_get_rom(s, current_rom, s->curr_rom_part);
-    if(!s->current_rom)
-    {
-        printf("Failed to find current rom (%s, part %s)!\n", current_rom, (s->curr_rom_part) ? s->curr_rom_part : "");
-        free(s->curr_rom_part);
-        s->curr_rom_part = NULL;
-    }
-
-    return 0;
-}
-
 int multirom_default_status(struct multirom_status *s)
 {
     s->is_second_boot = 0;
@@ -775,6 +615,7 @@ int multirom_default_status(struct multirom_status *s)
     s->enable_kmsg_logging = 0;
     s->rotation = MULTIROM_DEFAULT_ROTATION;
     s->anim_duration_coef = 1.f;
+    s->auto_boot_name = NULL;
 
     s->fstab = fstab_auto_load();
     if(!s->fstab)
@@ -888,6 +729,7 @@ int multirom_load_status(struct multirom_status *s)
     char line[1024];
     char current_rom[256] = { 0 };
     char auto_boot_rom[256] = { 0 };
+    int auto_boot_len;
 
     char name[64];
     char *pch;
@@ -937,10 +779,71 @@ int multirom_load_status(struct multirom_status *s)
 
     fclose(f);
 
-    // find USB drive if we're booting from it
-    if(s->curr_rom_part) // && s->is_second_boot)
+    // Fill the additional runtime settings
+    s->auto_boot_name = strdup(auto_boot_rom);
+    s->is_recovery_boot = 0;
+    s->bckp_auto_boot_seconds = s->auto_boot_seconds;
+    s->bckp_auto_boot_type = s->auto_boot_type;
+    s->bckp_curr_rom_part = (s->curr_rom_part != NULL ? strdup(s->curr_rom_part) : NULL);
+    s->bckp_hide_internal = s->hide_internal;
+
+    // Find USB drive if we're booting from it
+    auto_boot_len = strlen(s->auto_boot_name);
+    if (s->curr_rom_part || auto_boot_len > 0)
     {
-        multirom_update_and_scan_for_external_roms(s, s->curr_rom_part);
+        struct multirom_rom *r = NULL;
+        struct usb_partition *p = NULL;
+        int tries = 0;
+        int i;
+
+        // Search curr_rom_part
+        while (s->curr_rom_part && !p && tries < 10)
+        {
+            multirom_update_partitions(s);
+            p = multirom_get_partition(s, s->curr_rom_part);
+
+            if (p)
+            {
+                INFO("current part '%s' found\n", s->curr_rom_part);
+                multirom_scan_partition_for_roms(s, p);
+                break;
+            }
+
+            ++tries;
+            ERROR("part '%s' not found, waiting 1s (%d)\n", s->curr_rom_part, tries);
+            sleep(1);
+        }
+
+        // Search auto_boot_rom
+        tries = 0;
+        while (auto_boot_len > 0 && !r && tries < 10)
+        {
+            multirom_update_partitions(s);
+            for (i = 0; s->roms && s->roms[i];)
+            {
+                if (s->roms[i]->partition)
+                {
+                    list_rm_at(&s->roms, i, &multirom_free_rom);
+                    i = 0;
+                }
+                else ++i;
+            }
+            for (i = 0; s->partitions && s->partitions[i]; ++i)
+            {
+                multirom_scan_partition_for_roms(s, s->partitions[i]);
+            }
+
+            r = multirom_get_rom(s, s->auto_boot_name, NULL);
+            if (r)
+            {
+                INFO("autoboot rom '%s' found\n", s->auto_boot_name);
+                break;
+            }
+
+            ++tries;
+            ERROR("rom '%s' not found, waiting 1s (%d)\n", s->auto_boot_name, tries);
+            sleep(1);
+        }
     }
 
     s->current_rom = multirom_get_rom(s, current_rom, s->curr_rom_part);
@@ -948,7 +851,9 @@ int multirom_load_status(struct multirom_status *s)
     {
         ERROR("Failed to select current rom (%s, part %s), using Internal!\n", current_rom, s->curr_rom_part);
         s->current_rom = multirom_get_internal(s);
-        free(s->curr_rom_part);
+        if (s->curr_rom_part) {
+            free(s->curr_rom_part);
+        }
         s->curr_rom_part = NULL;
         if(!s->current_rom)
         {
@@ -968,7 +873,23 @@ int multirom_load_status(struct multirom_status *s)
             ERROR("Could not find rom %s to auto-boot\n", auto_boot_rom);
     }
 
-    if(s->int_display_name)
+    // Detect TWRP recovery boot
+    if (access("/twres/twrp", F_OK) >= 0)
+    {
+        INFO("Renaming primary boot for Recovery MultiROM\n");
+        s->current_rom = multirom_get_internal(s);
+        s->current_rom->name = realloc(s->current_rom->name, strlen(INTERNAL_RECOVERY_NAME)+1);
+        strcpy(s->current_rom->name, INTERNAL_RECOVERY_NAME);
+        s->auto_boot_rom = s->current_rom;
+        s->auto_boot_seconds = 5;
+        if (s->curr_rom_part) {
+            free(s->curr_rom_part);
+        }
+        s->curr_rom_part = NULL;
+        s->hide_internal = 0;
+        s->is_recovery_boot = 1;
+    }
+    else if (s->int_display_name)
     {
         struct multirom_rom *r = multirom_get_internal(s);
         r->name = realloc(r->name, strlen(s->int_display_name)+1);
@@ -1000,7 +921,7 @@ int multirom_save_status(struct multirom_status *s)
         return -1;
     }
 
-    multirom_fixup_rom_name(s->auto_boot_rom, auto_boot_name, "");
+    multirom_fixup_rom_name(s->auto_boot_rom, auto_boot_name, s->auto_boot_name);
     multirom_fixup_rom_name(s->current_rom, current_name, INTERNAL_ROM_NAME);
 
     fprintf(f, "current_rom=%s\n", current_name);
@@ -1059,9 +980,15 @@ void multirom_dump_status(struct multirom_status *s)
     INFO("  hide_internal=%d\n", s->hide_internal);
     INFO("  int_display_name=%s\n", s->int_display_name ? s->int_display_name : "NULL");
     INFO("  auto_boot_seconds=%d\n", s->auto_boot_seconds);
-    INFO("  auto_boot_rom=%s\n", s->auto_boot_rom ? s->auto_boot_rom->name : "NULL");
+    INFO("  auto_boot_rom=%s\n", s->auto_boot_rom ? s->auto_boot_rom->name : s->auto_boot_name);
     INFO("  auto_boot_type=%d\n", s->auto_boot_type);
     INFO("  curr_rom_part=%s\n", s->curr_rom_part ? s->curr_rom_part : "NULL");
+    INFO("\n");
+    INFO("  auto_boot_name=%s\n", s->auto_boot_name);
+    INFO("  bckp_auto_boot_seconds=%d\n", s->bckp_auto_boot_seconds);
+    INFO("  bckp_curr_rom_part=%s\n", s->bckp_curr_rom_part ? s->bckp_curr_rom_part : "NULL");
+    INFO("  bckp_hide_internal=%d\n", s->bckp_hide_internal);
+    INFO("  is_recovery_boot=%d\n", s->is_recovery_boot);
     INFO("\n");
 
     int i;
@@ -1081,6 +1008,8 @@ void multirom_free_status(struct multirom_status *s)
 {
     list_clear(&s->partitions, &multirom_destroy_partition);
     list_clear(&s->roms, &multirom_free_rom);
+    free(s->auto_boot_name);
+    free(s->bckp_curr_rom_part);
     free(s->curr_rom_part);
     free(s->int_display_name);
     if (s->fstab) fstab_destroy(s->fstab);
@@ -1098,7 +1027,7 @@ void multirom_find_usb_roms(struct multirom_status *s)
 {
     char auto_boot_name[MAX_ROM_NAME_LEN+1];
     char current_name[MAX_ROM_NAME_LEN+1];
-    multirom_fixup_rom_name(s->auto_boot_rom, auto_boot_name, "");
+    multirom_fixup_rom_name(s->auto_boot_rom, auto_boot_name, s->auto_boot_name);
     multirom_fixup_rom_name(s->current_rom, current_name, INTERNAL_ROM_NAME);
 
     // remove USB roms
@@ -1229,11 +1158,18 @@ int multirom_get_rom_type(struct multirom_rom *rom)
     // Handle android ROMs
     if(!multirom_path_exists(b, "boot"))
     {
-        if (!multirom_path_exists(b, "system") && !multirom_path_exists(b, "data") &&
+        if(!multirom_path_exists(b, "system") && !multirom_path_exists(b, "data") &&
             !multirom_path_exists(b, "cache"))
         {
             if(!rom->partition) return ROM_ANDROID_INTERNAL;
             else                return ROM_ANDROID_USB_DIR;
+        }
+        else if(!multirom_path_exists(b, "system.sparse.img") &&
+                (!multirom_path_exists(b, "data") || !multirom_path_exists(b, "data.sparse.img")) &&
+                (!multirom_path_exists(b, "cache") || !multirom_path_exists(b, "cache.sparse.img")))
+        {
+            if(!rom->partition) return ROM_ANDROID_INTERNAL_HYBRID;
+            else                return ROM_ANDROID_USB_HYBRID;
         }
         else if(!multirom_path_exists(b, "system.img") && !multirom_path_exists(b, "data.img") &&
                 !multirom_path_exists(b, "cache.img"))
@@ -1394,6 +1330,8 @@ int multirom_prepare_for_boot(struct multirom_status *s, struct multirom_rom *to
         case ROM_ANDROID_USB_IMG:
         case ROM_ANDROID_USB_DIR:
         case ROM_ANDROID_INTERNAL:
+        case ROM_ANDROID_INTERNAL_HYBRID:
+        case ROM_ANDROID_USB_HYBRID:
         {
             if(!(exit & (EXIT_REBOOT | EXIT_KEXEC)))
             {
@@ -1515,6 +1453,24 @@ int multirom_prep_android_mounts(struct multirom_status *s, struct multirom_rom 
     struct fstab_part *fw_part = NULL;
     int res = -1;
 
+    // Detect booting from an unmountable external partition
+    //  * Only external partitions have a partition defined
+    //  * Detect ext4 or f2fs as external unmountable because of vold
+    external_mount_part[0] = 0;
+    external_mount_path[0] = 0;
+    if (rom->partition && (strcmp(rom->partition->fs, "ext4") == 0 ||
+            strcmp(rom->partition->fs, "f2fs") == 0))
+    {
+        snprintf(external_mount_part, sizeof(external_mount_part),
+                "/dev/block/%s", rom->partition->name);
+        snprintf(external_mount_path, sizeof(external_mount_path),
+                "/mnt/mrom/%s", rom->partition->name);
+        snprintf(external_mount_fs, sizeof(external_mount_fs),
+                "%4s", rom->partition->fs);
+        ERROR("Booting from external unmountable partition: '%s', %s\n",
+                external_mount_part, external_mount_fs);
+    }
+
     sprintf(path, "%s/firmware.img", rom->base_path);
     has_fw = (access(path, R_OK) >= 0);
 
@@ -1550,7 +1506,7 @@ int multirom_prep_android_mounts(struct multirom_status *s, struct multirom_rom 
     }
     closedir(d);
 
-    if(multirom_process_android_fstab(fstab_name, has_fw, &fw_part) != 0)
+    if (multirom_process_android_fstab(fstab_name, has_fw, &fw_part, s) != 0)
         goto exit;
 
     unlink("/cache");
@@ -1561,59 +1517,75 @@ int multirom_prep_android_mounts(struct multirom_status *s, struct multirom_rom 
     if(has_fw)
         mkdir_with_perms("/firmware", 0771, "system", "system");
 
-    static const char *folders[2][3] =
-    {
-        { "system", "data", "cache" },
-        { "system.img", "data.img", "cache.img" },
-    };
-
-    unsigned long flags[2][3] = {
-        { MS_BIND | MS_RDONLY, MS_BIND, MS_BIND },
-        { MS_RDONLY | MS_NOATIME, MS_NOATIME, MS_NOATIME },
-    };
+    static const char *folders[3] = { "system"   , "data"                 , "cache"               };
+    unsigned long flags[3]        = { MS_RDONLY  ,  MS_NOSUID | MS_NODEV  ,  MS_NOSUID | MS_NODEV };
 
     uint32_t i;
     char from[256];
     char to[256];
-    int img = (int)(rom->type == ROM_ANDROID_USB_IMG);
-    for(i = 0; i < ARRAY_SIZE(folders[0]); ++i)
-    {
-        snprintf(from, sizeof(from), "%s/%s", rom->base_path, folders[img][i]);
-        snprintf(to, sizeof(to), "/%s", folders[0][i]);
 
-        if(img == 0)
-        {
-            if(mount(from, to, "ext4", flags[img][i], "discard,nomblk_io_submit") < 0)
-            {
+    for (i = 0; i < ARRAY_SIZE(folders); ++i) {
+        snprintf(to, sizeof(to), "/%s", folders[i]);
+
+        snprintf(from, sizeof(from), "%s/%s", rom->base_path, folders[i]);
+        if (!access(from, R_OK)) {
+            if(mount(from, to, "ext4", MS_BIND | flags[i], "discard,nomblk_io_submit") < 0) {
                 ERROR("Failed to mount %s to %s (%d: %s)\n", from, to, errno, strerror(errno));
                 goto exit;
-            }
+            } else
+                INFO("Bind mounted %s on %s\n", from, to);
+            continue;
         }
-        else
-        {
-            if(mount_image(from, to, "ext4", flags[img][i], NULL) < 0)
+
+        snprintf(from, sizeof(from), "%s/%s.img", rom->base_path, folders[i]);
+        if (!access(from, R_OK)) {
+            if(mount_image(from, to, "ext4", flags[i], NULL) < 0)
                 goto exit;
+            else
+                INFO("Loop mounted %s on %s\n", from, to);
+            continue;
         }
+
+        snprintf(from, sizeof(from), "%s/%s.sparse.img", rom->base_path, folders[i]);
+        if (!access(from, R_OK)) {
+            if(multirom_mount_image(from, to, "ext4", flags[i], NULL) < 0)
+                goto exit;
+            else
+                INFO("MultiROM Loop mounted %s on %s\n", from, to);
+            continue;
+        }
+
+        // Neither directory nor .img nor .sparse.img was found, panic
+        goto exit;
     }
 
-    // make sure /system is ro, otherwise remount it ro
-    // if it's not ro, then the dir permissions may get changed to disallow 'x' (eg HTC 10)
+
+    // mount() does not necessarily obey the mount options (eg, ro on system or nosuid on data)
+    // so attempt a remount on the partitions, but don't abort if the remount in unsuccessful,
+    // unless MR_PANIC_ON_FAILED_REMOUNT is set: eg on the HTC 10 if system is not ro, then the
+    // dir permissions may get changed to disallow 'x'
     struct statfs statfs_buf;
-    snprintf(to, sizeof(to), "/%s", folders[0][0]); // we could just use "/system", but this looks more sophisticated :P
-    INFO("Checking if system is ro\n");
-    if(statfs(to, &statfs_buf) < 0)
-    {
-        ERROR("Couldn't statfs %s (%d: %s)\n", to, errno, strerror(errno));
-    }
-    else if(!(statfs_buf.f_flags & ST_RDONLY))
-    {
-        INFO("system seems rw, attempting ro remount\n");
-        if(mount(NULL, to, NULL, MS_REMOUNT | MS_RDONLY | flags[img][0], NULL) < 0) // MS_RDONLY is redundant, but just in case it's changed/not in flags[][]
-        {
-            ERROR("Failed to remount ro %s (%d: %s)\n", to, errno, strerror(errno));
-            goto exit;
+    for (i = 0; i < ARRAY_SIZE(folders); ++i) {
+        snprintf(to, sizeof(to), "/%s", folders[i]);
+        if(statfs(to, &statfs_buf) < 0)
+            ERROR("Couldn't statfs %s (%d: %s)\n", to, errno, strerror(errno));
+        else if((flags[i] & ~statfs_buf.f_flags)) {
+            INFO("Mount flags of %s are 0x%08lX but should include 0x%08lX, attempting remount\n",
+                 to, (unsigned long) statfs_buf.f_flags, flags[i]);
+
+            if(mount(NULL, to, NULL, MS_REMOUNT | flags[i], NULL) < 0) {
+                ERROR("Failed to remount %s (%d: %s)\n", to, errno, strerror(errno));
+#ifdef MR_PANIC_ON_FAILED_REMOUNT
+                goto exit;
+#endif
+            }
+            else {
+                if(statfs(to, &statfs_buf) < 0)
+                    INFO("Remounted %s\n", to);
+                else
+                    INFO("Remounted %s flags=0x%08lX\n", to, (unsigned long) statfs_buf.f_flags);
+            }
         }
-        INFO("Remounted system as ro\n");
     }
 
     if(has_fw && fw_part)
@@ -1641,7 +1613,8 @@ exit:
     return res;
 }
 
-int multirom_process_android_fstab(char *fstab_name, int has_fw, struct fstab_part **fw_part)
+int multirom_process_android_fstab(char *fstab_name, int has_fw,
+        struct fstab_part **fw_part, struct multirom_status *s)
 {
     int res = -1;
 
@@ -1734,6 +1707,52 @@ int multirom_process_android_fstab(char *fstab_name, int has_fw, struct fstab_pa
         mkdir("/dummy_tmpfs", 0644);
     }
 
+    // Booting from an unmountable external partition
+    if (external_mount_path[0] != 0)
+    {
+        // Access MultiROM fstab as second mount path reference
+        struct fstab_part* ext_part = NULL;
+        for (int i = 0; i < s->fstab->count; ++i)
+        {
+            if (strcmp(s->fstab->parts[i]->device, external_mount_part) == 0)
+            {
+                ext_part = s->fstab->parts[i];
+                break;
+            }
+        }
+
+        // Handle external MicroSD boot for voldmanaged removal
+        if (strstr(external_mount_part, "mmcblk1p1") != NULL ||
+                ext_part && strstr(ext_part->path, "external_sd") != NULL)
+        {
+            ERROR("Searching for voldmanaged 'sdcard1' flag in fstab\n");
+            for (int i = 0; i < tab->count; ++i)
+            {
+                if (strstr(tab->parts[i]->options2, "voldmanaged=sdcard1") != NULL)
+                {
+                    ERROR("Removing '%s' from fstab to avoid 'voldmanaged'\n",
+                            tab->parts[i]->device);
+                    tab->parts[i]->disabled = 1;
+                }
+            }
+        }
+        // Handle external USB boot for voldmanaged removal
+        else if (strstr(external_mount_part, "usb") != NULL ||
+                ext_part && strstr(ext_part->path, "usb") != NULL)
+        {
+            ERROR("Searching for voldmanaged 'usb' flag in fstab\n");
+            for (int i = 0; i < tab->count; ++i)
+            {
+                if (strstr(tab->parts[i]->options2, "voldmanaged=usb") != NULL)
+                {
+                    ERROR("Removing '%s' from fstab to avoid 'voldmanaged'\n",
+                            tab->parts[i]->device);
+                    tab->parts[i]->disabled = 1;
+                }
+            }
+        }
+    }
+
     if(fstab_save(tab, fstab_name) == 0)
         res = 0;
 
@@ -1771,11 +1790,16 @@ int multirom_create_media_link(struct multirom_status *s)
         if(!media_new) from = 0;
         else           from = 1;
     }
-    else if(api_level >= 17)
+    else if(api_level <= 22)
     {
         from = 0;
         if(!media_new) to = 3;
         else           to = 2;
+    }
+    else
+    {
+        from = 0;
+        to = 2;
     }
 
     ERROR("Making media dir: api %d, media_new %d, %s to %s\n", api_level, media_new, paths[from], paths[to]);
@@ -1819,6 +1843,96 @@ int multirom_create_media_link(struct multirom_status *s)
         // We need to set SELinux context for this file in case it was created by multirom,
         // but can't do it here because selinux was not initialized
         rcadditions_append_trigger(&s->rc, "post-fs-data", "    restorecon " LAYOUT_VERSION "\n");
+    }
+
+    // Booting from an unmountable external partition
+    if (external_mount_path[0] != 0)
+    {
+        // Select internal media path for 'MultiROM/external'
+        char path_ext[256];
+        char path_multirom[256];
+        if (stat("/data/media/0", &info) >= 0)
+        {
+            snprintf(path_ext, sizeof(path_ext),
+                    "/data/media/0/MultiROM/external");
+            snprintf(path_multirom, sizeof(path_multirom),
+                    "/data/media/0/MultiROM");
+        }
+        else
+        {
+            snprintf(path_ext, sizeof(path_ext),
+                    "/data/media/MultiROM/external");
+            snprintf(path_multirom, sizeof(path_multirom),
+                    "/data/media/MultiROM");
+        }
+
+        INFO("Preparing to mount '%s' to '%s'\n", external_mount_path,
+                path_ext);
+
+        // Open MultiROM path and unset immutable
+        int fd = open(path_multirom, O_RDONLY | O_NONBLOCK);
+        long flags;
+        if (fd >= 0) {
+            if (ioctl(fd, FS_IOC_GETFLAGS, &flags) >= 0) {
+                flags &= ~FS_IMMUTABLE_FL;
+                if (ioctl(fd, FS_IOC_SETFLAGS, &flags) >= 0) {
+                    INFO("Removed FS_IMMUTABLE_FL for '%s'\n", path_multirom);
+                } else {
+                    ERROR("Failed to unset FS_IMMUTABLE_FL for '%s': %d (%s)\n",
+                            path_multirom, errno, strerror(errno));
+                    close(fd);
+                    fd = -1;
+                }
+            } else {
+                ERROR("Failed to check FS_IMMUTABLE_FL for '%s': %d (%s)\n",
+                        path_multirom, errno, strerror(errno));
+                close(fd);
+                fd = -1;
+            }
+        }
+
+        // Create and set accesses to 'MultiROM/external' on internal media
+        mkdir(path_ext, 0770);
+        chmod(path_ext, 0770);
+        chown(path_ext, 0, 0);
+
+        // Bind external partition to internal media 'MultiROM/external'
+        if (mount(external_mount_path, path_ext, external_mount_fs, MS_BIND,
+                "") < 0)
+        {
+            ERROR("Failed to bind '%s' (%s) to '%s': %d (%s)\n",
+                    external_mount_path, external_mount_fs, path_ext, errno,
+                        strerror(errno));
+            external_mount_part[0] = 0;
+            external_mount_path[0] = 0;
+            return 0;
+        }
+
+        // Apply internal media owners for 'MultiROM/external'
+        unsigned int media_rw_id = decode_uid("media_rw");
+        if (media_rw_id != -1U)
+        {
+            chown(path_ext, (uid_t)media_rw_id, (gid_t)media_rw_id);
+        }
+
+        // Append init restorecon for 'MultiROM/external' context
+        char restorecon_ext[64];
+        snprintf(restorecon_ext, sizeof(restorecon_ext),
+                "    restorecon %s\n", path_ext);
+        rcadditions_append_trigger(&s->rc, "post-fs-data",
+                restorecon_ext);
+
+        // Restore immutable and close MultiROM path
+        if (fd >= 0) {
+            flags |= FS_IMMUTABLE_FL;
+            if (ioctl(fd, FS_IOC_SETFLAGS, &flags) >= 0) {
+                INFO("Restored FS_IMMUTABLE_FL for '%s'\n", path_multirom);
+            } else {
+                ERROR("Failed to reset FS_IMMUTABLE_FL for '%s': %d (%s)\n",
+                        path_multirom, errno, strerror(errno));
+            }
+            close(fd);
+        }
     }
 
     return 0;
@@ -2072,7 +2186,9 @@ int multirom_load_kexec(struct multirom_status *s, struct multirom_rom *rom)
     kexec_init(&kexec, kexec_path);
     kexec_add_arg(&kexec, "--mem-min="MR_KEXEC_MEM_MIN);
 #ifdef MR_KEXEC_DTB
+#ifdef MR_NOT_64BIT
     kexec_add_arg_prefix(&kexec, "--boardname=", TARGET_DEVICE);
+#endif
 #endif
 
     switch(rom->type)
@@ -2080,6 +2196,8 @@ int multirom_load_kexec(struct multirom_status *s, struct multirom_rom *rom)
         case ROM_ANDROID_INTERNAL:
         case ROM_ANDROID_USB_DIR:
         case ROM_ANDROID_USB_IMG:
+        case ROM_ANDROID_INTERNAL_HYBRID:
+        case ROM_ANDROID_USB_HYBRID:
             if(multirom_fill_kexec_android(s, rom, &kexec) != 0)
                 goto exit;
             break;
@@ -2143,10 +2261,16 @@ int multirom_fill_kexec_android(struct multirom_status *s, struct multirom_rom *
     kexec_add_arg(kexec, "--initrd=/initrd.img");
 
 #ifdef MR_KEXEC_DTB
-    if(libbootimg_dump_dtb(&img, "/dtb.img") >= 0)
+    if(libbootimg_dump_dtb(&img, "/dtb.img") >= 0) {
+        printf("DTB: dtb image found!");
         kexec_add_arg(kexec, "--dtb=/dtb.img");
-    else
+    }
+    else {
+        printf("DTB: no dtb image found!");
+#ifdef MR_NOT_64BIT
         kexec_add_arg(kexec, "--dtb");
+#endif
+    }
 #endif
 
     char cmdline[1536];
@@ -2306,11 +2430,15 @@ int multirom_fill_kexec_linux(struct multirom_status *s, struct multirom_rom *ro
     }
     else
     {
+        printf("DTB: dtb image found!");
         str = find_boot_file("%r/dtb.img", root_path, rom->base_path);
     }
 
     if(!str)
+        printf("DTB: no dtb image found!");
+#ifdef MR_NOT_64BIT
         kexec_add_arg(kexec, "--dtb");
+#endif
     else
     {
         kexec_add_arg_prefix(kexec, "--dtb=", str);
@@ -2705,12 +2833,6 @@ int multirom_update_partitions(struct multirom_status *s)
             goto next_itr;
         }
 
-        if(strncmp(name, "loop", 4) == 0) // ignore loop devices
-        {
-            free(name);
-            goto next_itr;
-        }
-
         part = mzalloc(sizeof(struct usb_partition));
         part->name = name;
 
@@ -2754,59 +2876,8 @@ next_itr:
     return 0;
 }
 
-int is_mounted_properly(const char *src, const char *mnt_path)
-{
-    int res = 0;
-
-    FILE *f;
-
-    f = fopen("/proc/mounts", "re");
-    if (f)
-    {
-        char mount_dev[256];
-        char mount_dir[256];
-        char mount_type[256];
-        char mount_opts[256];
-        int mount_freq;
-        int mount_passno;
-        int match;
-
-        do {
-            match = fscanf(f, "%255s %255s %255s %255s %d %d\n",
-                           mount_dev, mount_dir, mount_type,
-                           mount_opts, &mount_freq, &mount_passno);
-            mount_dev[255] = 0;
-            mount_dir[255] = 0;
-            mount_type[255] = 0;
-            mount_opts[255] = 0;
-            if ((match == 6) && (strcmp(src, mount_dev) == 0) && (strcmp(mnt_path, mount_dir) == 0)) {
-                // check if the dir is empty, if so even though the mount entry exists, the actual path isn't mounted
-                int n = 0;
-                DIR *dir = opendir(mnt_path);
-                if (dir) {
-                    while (readdir(dir)) {
-                        if (++n > 2) {
-                            res = 1;
-                            break;
-                        }
-                    }
-                    closedir(dir);
-                }
-                break;
-            }
-        } while (match != EOF);
-
-        fclose(f);
-    }
-
-    return res;
-}
-
 int multirom_mount_usb(struct usb_partition *part)
 {
-    int res = 0;
-    part->mount_path = NULL;
-
     mkdir("/mnt", 0777);
     mkdir("/mnt/mrom", 0777);
 
@@ -2821,18 +2892,13 @@ int multirom_mount_usb(struct usb_partition *part)
     char src[256];
     snprintf(src, sizeof(src), "/dev/block/%s", part->name);
 
-    if(is_mounted_properly(src, path))
-    {
-        INFO("Partition %s already mounted on %s\n", src, path);
-        res = 0;
-    }
-    else if(strncmp(part->fs, "ntfs", 4) == 0)
+    if(strncmp(part->fs, "ntfs", 4) == 0)
     {
         char *cmd[] = { ntfs_path, src, path, NULL };
         if(run_cmd(cmd) != 0)
         {
             ERROR("Failed to mount %s with ntfs-3g\n", src);
-            res = -1;
+            return -1;
         }
     }
     else if(strcmp(part->fs, "exfat") == 0)
@@ -2841,51 +2907,17 @@ int multirom_mount_usb(struct usb_partition *part)
         if(run_cmd(cmd) != 0)
         {
             ERROR("Failed to mount %s with exfat\n", src);
-            res = -1;
+            return -1;
         }
     }
     else if(mount(src, path, part->fs, MS_NOATIME, "") < 0)
     {
         ERROR("Failed to mount %s (%d: %s)\n", src, errno, strerror(errno));
-        res = -1;
+        return -1;
     }
 
     part->mount_path = strdup(path);
-    return res;
-}
-
-void multirom_update_and_scan_for_external_roms(struct multirom_status *s, char *part_uuid)
-{
-    if (!s->partitions)
-    {
-        // no external partitions exist, so either there are none, or this is first run
-        // so we can proceed in the normal fashion
-        struct usb_partition *p = NULL;
-        int tries = 0;
-        while(!p && tries < 10) // is 10seconds enough for USB-OTG
-        {
-            multirom_update_partitions(s);
-
-            p = multirom_get_partition(s, part_uuid);
-
-            if(p)
-            {
-                multirom_scan_partition_for_roms(s, p);
-                break;
-            }
-
-            ++tries;
-            ERROR("part %s not found, waiting 1s (%d)\n", part_uuid, tries);
-            sleep(1);
-        }
-    }
-    else
-    {
-        // external partition exist, multirom_update_partitions will destroy all partitions information, so
-        // so we'll just use multirom_find_usb_roms(s) to repopulate everything, the alternative is just too
-        // much unnecessary code
-        multirom_find_usb_roms(s);
-    }
+    return 0;
 }
 
 void *multirom_usb_refresh_thread_work(void *status)
@@ -2996,9 +3028,6 @@ int multirom_copy_log(char *klog, const char *dest_path_relative)
 
 struct usb_partition *multirom_get_partition(struct multirom_status *s, char *uuid)
 {
-    // FIXME: This may need to be reconsidered, it is possible for 2 different partitions
-    //        to have the same uuid which will lead to a false positive.
-    //        Probably a good idea, to add mount point and uuid
     int i;
     for(i = 0; s->partitions && s->partitions[i]; ++i)
         if(strcmp(s->partitions[i]->uuid, uuid) == 0)
@@ -3043,10 +3072,9 @@ int multirom_run_scripts(const char *type, struct multirom_rom *rom)
 
 #define IC_TYPE_PREDEF 0
 #define IC_TYPE_USER   1
-#define USER_IC_PATH "../Android/data/com.tassadar.multirommgr/files"
-#define USER_IC_PATH_LEN 46
+#define USER_IC_PATH "../Android/data/com.tassadar.multirommgr/files"  // TODO: just use /realdata/media/[0]
 #define DEFAULT_ICON "/icons/romic_default.png"
-#define DEFAULT_ICON_LEN 24
+#define DEFAULT_ANDROID_ICON "/icons/romic_android_default.png"
 
 void multirom_find_rom_icon(struct multirom_rom *rom)
 {
@@ -3096,9 +3124,16 @@ void multirom_find_rom_icon(struct multirom_rom *rom)
         }
         case IC_TYPE_USER:
         {
-            len = strlen(mrom_dir()) + 1 + USER_IC_PATH_LEN + 1 + len + 4 + 1; // + / + / + .png + \0
-            rom->icon_path = malloc(len);
-            snprintf(rom->icon_path, len, "%s/%s/%s.png", mrom_dir(), USER_IC_PATH, buff);
+            if (strstr(mrom_dir(), "MultiROM")) {
+                len = strlen(mrom_dir()) + 1 + 3 + sizeof(USER_IC_PATH) + 1 + len + 4; // + / + / + .png + \0 (sizeof() includes trailing null)
+                rom->icon_path = malloc(len);
+                snprintf(rom->icon_path, len, "%s/../%s/%s.png", mrom_dir(), USER_IC_PATH, buff);
+            }
+            else {
+                len = strlen(mrom_dir()) + 1 + sizeof(USER_IC_PATH) + 1 + len + 4; // + / + / + .png + \0 (sizeof() includes trailing null)
+                rom->icon_path = malloc(len);
+                snprintf(rom->icon_path, len, "%s/%s/%s.png", mrom_dir(), USER_IC_PATH, buff);
+            }
             break;
         }
     }
@@ -3111,7 +3146,14 @@ fail:
     if(f)
         fclose(f);
 
-    len = strlen(mrom_dir()) + DEFAULT_ICON_LEN + 1;
-    rom->icon_path = realloc(rom->icon_path, len);
-    snprintf(rom->icon_path, len, "%s%s", mrom_dir(), DEFAULT_ICON);
+    if (rom->type & MASK_ANDROID) {
+        len = strlen(mrom_dir()) + sizeof(DEFAULT_ANDROID_ICON);  // sizeof() includes trailing null
+        rom->icon_path = realloc(rom->icon_path, len);
+        snprintf(rom->icon_path, len, "%s%s", mrom_dir(), DEFAULT_ANDROID_ICON);
+    }
+    else {
+        len = strlen(mrom_dir()) + sizeof(DEFAULT_ICON); // sizeof() includes trailing null
+        rom->icon_path = realloc(rom->icon_path, len);
+        snprintf(rom->icon_path, len, "%s%s", mrom_dir(), DEFAULT_ICON);
+    }
 }

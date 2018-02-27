@@ -24,6 +24,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 #include <cutils/android_reboot.h>
 
 #include "devices.h"
@@ -37,7 +40,11 @@
 #include "encryption.h"
 
 #ifdef MR_POPULATE_BY_NAME_PATH
-	#include "Populate_ByName_using_emmc.c"
+#include "Populate_ByName_using_emmc.c"
+#endif
+
+#ifdef MR_USE_BINARY_SELECTOR
+#include "multirom_binary_selector.h"
 #endif
 
 #define EXEC_MASK (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)
@@ -57,17 +64,42 @@ static int find_multirom(void)
     struct stat info;
 
     static const char *paths[] = {
+        REALDATA"/media/0/MultiROM/multirom",
+        REALDATA"/media/MultiROM/multirom",
         REALDATA"/media/0/multirom", // 4.2
         REALDATA"/media/multirom",
         NULL,
     };
 
-    for(i = 0; paths[i]; ++i)
-    {
+    for(i = 0; paths[i]; ++i) {
         if(stat(paths[i], &info) < 0)
             continue;
 
         strcpy(path_multirom, paths[i]);
+
+        if (i < 2) {
+            // Make sure to set the container dir to immutable
+            char main_path[64];
+            strncpy(main_path, path_multirom, strlen(path_multirom) - (sizeof("/multirom") - 1));
+            main_path[strlen(path_multirom) - (sizeof("/multirom") - 1)] = '\0';
+
+            int fd = open(main_path, O_RDONLY | O_NONBLOCK);
+            if (fd >= 0) {
+                long flags;
+                if (ioctl(fd, FS_IOC_GETFLAGS, &flags) >= 0) {
+                    flags |= FS_IMMUTABLE_FL;
+                    if (ioctl(fd, FS_IOC_SETFLAGS, &flags) < 0)
+                        ERROR("Failed FS_IOC_SETFLAGS: %s!\n", strerror(errno));
+                    else
+                        INFO("Set FS_IMMUTABLE_FL on %s.\n", main_path);
+                }
+                else
+                    ERROR("Failed FS_IOC_GETFLAGS: %s!\n", strerror(errno));
+                close(fd);
+            }
+            else
+                ERROR("Failed to open %s: %s!\n", main_path, strerror(errno));
+        }
         return 0;
     }
     return -1;
@@ -77,6 +109,7 @@ static void run_multirom(void)
 {
     char path[256];
     struct stat info;
+    char multirom_bin[256] = MULTIROM_BIN;
 
     // busybox
     sprintf(path, "%s/%s", path_multirom, BUSYBOX_BIN);
@@ -91,8 +124,18 @@ static void run_multirom(void)
     sprintf(path, "%s/restart_after_crash", path_multirom);
     int restart = (stat(path, &info) >= 0);
 
+#ifdef MR_USE_BINARY_SELECTOR
+    if (get_mutirom_binary_string(multirom_bin) == -1)
+    {
+        strcpy(multirom_bin, MULTIROM_BIN);
+    }
+
+    // ensure null termination of multirom name string
+    multirom_bin[255] = '\0';
+#endif
+
     // multirom
-    sprintf(path, "%s/%s", path_multirom, MULTIROM_BIN);
+    sprintf(path, "%s/%s", path_multirom, &multirom_bin);
     if (stat(path, &info) < 0)
     {
         ERROR("Could not find multirom: %s\n", path);
@@ -242,6 +285,12 @@ static int is_charger_mode(void)
     return charger_mode;
 }
 
+static int is_secondary_recovery(void)
+{
+    return (access("/twres/twrp", F_OK) >= 0 && (access("/boot.txt", F_OK) >= 0
+            || access("/bootrec/boot-log.txt", F_OK) >= 0));
+}
+
 static void fixup_symlinks(void)
 {
     static const char *init_links[] = { "/sbin/ueventd", "/sbin/watchdogd" };
@@ -345,6 +394,13 @@ int main(int argc, char *argv[])
     if(is_charger_mode())
     {
         INFO("Charger mode detected, skipping multirom\n");
+        goto run_main_init;
+    }
+
+    // Detect secondary recovery boot
+    if (is_secondary_recovery())
+    {
+        INFO("Secondary recovery detected, skipping multirom\n");
         goto run_main_init;
     }
 

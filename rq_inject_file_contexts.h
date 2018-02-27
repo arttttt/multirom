@@ -15,15 +15,14 @@
  * along with MultiROM.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef VERSION_H
-#define VERSION_H
-    #define VERSION_MULTIROM 33
-    #define VERSION_TRAMPOLINE 27
+#ifndef _RQ_INJECT_FILE_CONTEXTS_H
+#define _RQ_INJECT_FILE_CONTEXTS_H
 
-    // For device-specific fixes. Use letters, the version will then be like "12a"
-    #ifdef MR_DEVICE_SPECIFIC_VERSION
-        #define VERSION_DEV_FIX MR_DEVICE_SPECIFIC_VERSION
-    #else
-        #define VERSION_DEV_FIX "x"
-    #endif
-#endif
+/*
+ * Main inject_file_contexts() function will determine
+ * if the file is a compiled binary format or text format
+ * and act accordingly.
+ */
+int inject_file_contexts(const char *path);
+
+#endif //_RQ_INJECT_FILE_CONTEXTS_H
