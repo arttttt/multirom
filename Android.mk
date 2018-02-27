@@ -40,6 +40,11 @@ LOCAL_UNSTRIPPED_PATH := $(TARGET_ROOT_OUT_UNSTRIPPED)
 LOCAL_STATIC_LIBRARIES := libcutils libc libmultirom_static
 LOCAL_WHOLE_STATIC_LIBRARIES := libm libcutils libpng libz libft2_mrom_static
 
+# Make code aware of the Arch
+ifneq ($(TARGET_ARCH),arm64)
+    LOCAL_CFLAGS += -DMR_NOT_64BIT
+endif
+
 # clone libbootimg to /system/extras/ from
 # https://github.com/Tasssadar/libbootimg.git
 LOCAL_STATIC_LIBRARIES += libbootimg
@@ -67,8 +72,6 @@ endif
 
 include $(BUILD_EXECUTABLE)
 
-
-
 # Trampoline
 include $(multirom_local_path)/trampoline/Android.mk
 
@@ -80,11 +83,6 @@ include $(multirom_local_path)/install_zip/Android.mk
 
 # Kexec-tools
 include $(multirom_local_path)/kexec-tools/Android.mk
-
-# Make code aware of the Arch
-ifneq ($(TARGET_ARCH),arm64)
-    LOCAL_CFLAGS += -DMR_NOT_64BIT
-endif
 
 # adbd
 include $(multirom_local_path)/adbd/Android.mk
