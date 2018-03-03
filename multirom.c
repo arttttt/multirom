@@ -618,13 +618,13 @@ void multirom_get_rom_icon(const char *base_path)
     char* roms[] = { "lineage" };
 
     char line[256];
+    char* icon = NULL;
     while(fgets(line, sizeof(line), f))
     {
         if(strstr(line, "ro.product.name=") == line) {
             name = strchr(line, '=')+1;
             
             for(i = 0; i < ARRAY_SIZE(roms); i++) {
-                char* icon = NULL;
                 if (strncmp(roms[i], "lineage", strlen(roms[i])) == 0) {
                     icon = "los";
                 }
