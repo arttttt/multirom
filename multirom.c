@@ -638,8 +638,8 @@ void multirom_get_rom_icon(const char *base_path)
                             fclose(f);
                         }
                     }
+                    break;
                 }
-                break;
             }
             break;
         }
