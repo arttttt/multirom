@@ -601,6 +601,52 @@ static int compare_rom_names(const void *a, const void *b)
     return 0;
 }
 
+void multirom_get_rom_icon(const char *base_path)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s/system/build.prop", base_path);
+    
+    FILE *f = fopen(path, "re");
+    if(!f)
+    {
+        ERROR("Could not open %s to get rom name!\n", path);
+        return;
+    }
+
+    unsigned int i;
+    char* name;
+    char* roms[] = { "lineage" };
+
+    char line[256];
+    while(fgets(line, sizeof(line), f))
+    {
+        if(strstr(line, "ro.product.name=") == line) {
+            name = strchr(line, '=')+1;
+            
+            for(i = 0; i < ARRAY_SIZE(roms); i++) {
+                char* icon = NULL;
+                if (strncmp(roms[i], "lineage", strlen(roms[i])) == 0) {
+                    icon = "los";
+                }
+                if (icon != NULL) {
+                    snprintf(path, sizeof(path), "%s/.icon_data", base_path);
+                    if(access(path, F_OK) < 0) {
+                        FILE *f = fopen(path, "we");
+                        if(f)
+                        {
+                            fprintf(f, "predef_set\ncom.tassadar.multirommgr:drawable/romic_%s\n", icon);
+                            fclose(f);
+                        }
+                    }
+                }
+                break;
+            }
+            break;
+        }
+    }
+    fclose(f);
+}
+
 int multirom_default_status(struct multirom_status *s)
 {
     s->is_second_boot = 0;
@@ -672,7 +718,11 @@ int multirom_default_status(struct multirom_status *s)
 
         snprintf(path, sizeof(path), "%s/boot.img", rom->base_path);
         rom->has_bootimg = access(path, R_OK) == 0 ? 1 : 0;
-
+        
+        if (strcmp(rom->name, "Internal") != 0) {
+            multirom_get_rom_icon(rom->base_path);
+        }
+        
         multirom_find_rom_icon(rom);
 
         list_add(&add_roms, rom);
@@ -1121,6 +1171,10 @@ int multirom_scan_partition_for_roms(struct multirom_status *s, struct usb_parti
 
         sprintf(path, "%s/boot.img", rom->base_path);
         rom->has_bootimg = access(path, R_OK) == 0 ? 1 : 0;
+        
+        if (strcmp(rom->name, "Internal") != 0) {
+            multirom_get_rom_icon(rom->base_path);
+        }
 
         multirom_find_rom_icon(rom);
 
