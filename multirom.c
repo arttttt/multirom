@@ -601,6 +601,8 @@ static int compare_rom_names(const void *a, const void *b)
     return 0;
 }
 
+#define DEFAULT_ICON "/icons/romic_default.png"
+
 void multirom_get_rom_icon(const char *base_path)
 {
     char path[256];
@@ -615,30 +617,39 @@ void multirom_get_rom_icon(const char *base_path)
 
     unsigned int i;
     char* name;
-    char* roms[] = { "lineage" };
+    char* roms[] = { "lineage", "du", "cm", "slim", "omni", "aokp" };
 
     char line[256];
-    char* icon = NULL;
+    char* icon;
     while(fgets(line, sizeof(line), f))
     {
         if(strstr(line, "ro.product.name=") == line) {
             name = strchr(line, '=')+1;
             
             for(i = 0; i < ARRAY_SIZE(roms); i++) {
-                if (strncmp(roms[i], "lineage", strlen(roms[i])) == 0) {
+                if (strncmp(name, "lineage", strlen("lineage")) == 0) {
                     icon = "los";
+                } else if (strncmp(name, "du", strlen("du")) == 0) {
+                    icon = "du";
+                } else if (strncmp(name, "cm", strlen("cm")) == 0) {
+                    icon = "cm2";
+                } else if (strncmp(name, "slim", strlen("slim")) == 0) {
+                    icon = "slimkat";
+                } else if (strncmp(name, "omni", strlen("omni")) == 0) {
+                    icon = "omni";
+                } else if (strncmp(name, "aokp", strlen("aokp")) == 0) {
+                    icon = "aokp1";
+                } else {
+                    icon = DEFAULT_ICON;
                 }
-                if (icon != NULL) {
-                    snprintf(path, sizeof(path), "%s/.icon_data", base_path);
-                    if(access(path, F_OK) < 0) {
-                        FILE *f = fopen(path, "we");
-                        if(f)
-                        {
-                            fprintf(f, "predef_set\ncom.tassadar.multirommgr:drawable/romic_%s\n", icon);
-                            fclose(f);
-                        }
+                snprintf(path, sizeof(path), "%s/.icon_data", base_path);
+                if(access(path, F_OK) < 0) {
+                    FILE *f = fopen(path, "we");
+                    if(f)
+                    {
+                        fprintf(f, "predef_set\ncom.tassadar.multirommgr:drawable/romic_%s\n", icon);
+                        fclose(f);
                     }
-                    break;
                 }
             }
             break;
@@ -3128,7 +3139,6 @@ int multirom_run_scripts(const char *type, struct multirom_rom *rom)
 #define IC_TYPE_PREDEF 0
 #define IC_TYPE_USER   1
 #define USER_IC_PATH "../Android/data/com.tassadar.multirommgr/files"  // TODO: just use /realdata/media/[0]
-#define DEFAULT_ICON "/icons/romic_default.png"
 #define DEFAULT_ANDROID_ICON "/icons/romic_android_default.png"
 
 void multirom_find_rom_icon(struct multirom_rom *rom)
