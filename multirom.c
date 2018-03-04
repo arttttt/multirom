@@ -601,8 +601,6 @@ static int compare_rom_names(const void *a, const void *b)
     return 0;
 }
 
-#define DEFAULT_ICON "/icons/romic_default.png"
-
 void multirom_get_rom_icon(const char *base_path)
 {
     char path[256];
@@ -620,7 +618,7 @@ void multirom_get_rom_icon(const char *base_path)
     char* roms[] = { "lineage", "du", "cm", "slim", "omni", "aokp" };
 
     char line[256];
-    char* icon;
+    char* icon = NULL;
     while(fgets(line, sizeof(line), f))
     {
         if(strstr(line, "ro.product.name=") == line) {
@@ -639,17 +637,19 @@ void multirom_get_rom_icon(const char *base_path)
                     icon = "omni";
                 } else if (strncmp(name, "aokp", strlen("aokp")) == 0) {
                     icon = "aokp1";
-                } else {
-                    icon = DEFAULT_ICON;
                 }
-                snprintf(path, sizeof(path), "%s/.icon_data", base_path);
-                if(access(path, F_OK) < 0) {
-                    FILE *f = fopen(path, "we");
-                    if(f)
-                    {
-                        fprintf(f, "predef_set\ncom.tassadar.multirommgr:drawable/romic_%s\n", icon);
-                        fclose(f);
+                
+                if (icon != NULL) {
+                    snprintf(path, sizeof(path), "%s/.icon_data", base_path);
+                    if(access(path, F_OK) < 0) {
+                        FILE *f = fopen(path, "we");
+                        if(f)
+                       {
+                            fprintf(f, "predef_set\ncom.tassadar.multirommgr:drawable/romic_%s\n", icon);
+                            fclose(f);
+                        }
                     }
+                    break;
                 }
             }
             break;
@@ -3139,6 +3139,7 @@ int multirom_run_scripts(const char *type, struct multirom_rom *rom)
 #define IC_TYPE_PREDEF 0
 #define IC_TYPE_USER   1
 #define USER_IC_PATH "../Android/data/com.tassadar.multirommgr/files"  // TODO: just use /realdata/media/[0]
+#define DEFAULT_ICON "/icons/romic_default.png"
 #define DEFAULT_ANDROID_ICON "/icons/romic_android_default.png"
 
 void multirom_find_rom_icon(struct multirom_rom *rom)
